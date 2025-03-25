@@ -1,0 +1,310 @@
+---
+title: "Mapping Climate Resilient Coral Reefs in Fiji"
+author:
+  - name: "Janice Taga"
+  - name: "Iain R. Caldwell"
+date: 02/23/2025
+format: 
+  html: #for website
+    embed-resources: true
+editor: visual
+code-fold: true
+code-summary: "Show the code"
+toc: true
+title-block-banner: "#f0f3f5"
+title-block-banner-color: "black"
+include-after-body: "footer.html"
+---
+
+## Access relevant data from MERMAID
+
+Get Fiji data at all levels (with life history assignments)
+
+```{r}
+#| label: Load packages and data
+#| warning: false
+
+rm(list = ls()) #remove past stored objects
+options(scipen = 999) #turn off scientific notation
+
+####  Load packages and libraries ####
+library(plotly)
+library(tidyverse)
+library(mermaidr)
+library(sf)
+library(ggplot2)
+library(leaflet) #for mapping
+library(htmlwidgets)
+library(htmltools)
+library(leaflegend)
+library(leafpop)
+
+#### Retrieve WCS Fiji project data ####
+fijiProjects <- mermaid_get_my_projects(include_test_projects = F) %>% 
+  filter(countries == "Fiji")
+
+wcsFijiProjects <- fijiProjects %>% 
+  filter(grepl(pattern = "WCS Fiji", x = tags)) 
+
+fijiBenthicPitObsTBL <- mermaid_get_project_data(
+  project = wcsFijiProjects,
+  method = "benthicpit",
+  data = "observations"
+)
+```
+
+## Identify transects with sufficient data and best observations
+
+Identify and remove any of the benthic PIT transects (i.e. MERMAID sample units) that have \>20% of the corals unassigned to a life history strategy. Also filter to use data from the most reliable observers.
+
+```{r}
+#| label: Calculate % unassigned hard coral and remove any >20% unassigned
+
+fijiBenthicPitSuUnassignedTBL <- fijiBenthicPitObsTBL %>% 
+  filter(benthic_category == "Hard coral") %>% 
+  group_by(sample_unit_id) %>% 
+  summarise(NumUnassignedHardCoral = sum(life_histories_competitive == 0 &
+                                           life_histories_generalist == 0 &
+                                           life_histories_stress_tolerant == 0 &
+                                           life_histories_weedy == 0)) %>% 
+  ungroup() %>% 
+  right_join(fijiBenthicPitObsTBL %>% 
+               group_by(sample_unit_id) %>% 
+               summarise(NumPts = length(benthic_category)) %>% 
+               ungroup,
+             by = "sample_unit_id") %>% 
+  mutate(NumUnassignedHardCoral = replace_na(NumUnassignedHardCoral, 0),
+         PercUnassignedHardCoral = NumUnassignedHardCoral/NumPts*100) %>% 
+  select(sample_unit_id, PercUnassignedHardCoral)
+
+#Get the sample unit level data and remove >20% unassigned
+fijiBenthicPitSuTBL <- mermaid_get_project_data(
+    project = wcsFijiProjects,
+    method = "benthicpit",
+    data = "sampleunits") %>%
+  left_join(fijiBenthicPitSuUnassignedTBL %>% 
+              rename(sample_unit_ids = sample_unit_id),
+            by = "sample_unit_ids") %>% 
+  filter(PercUnassignedHardCoral <= 20) 
+
+#Remove data from the following observers based on feedback
+remObsVect <- c("Andra Whiteside",
+                "Rob Howard",
+                "Wayne Moey",
+                "Epeli Logan",
+                "Steven Lee",
+                "Alex Patrick",
+                "Naushad Yakub",
+                "Thomas Tui",
+                "Una Mara")
+
+#Also remove "Sirilo Dulunaqio" but only for surveys before 2012
+fijiBenthicPitSuTBL <- fijiBenthicPitSuTBL %>% 
+  filter(!observers %in% remObsVect) %>% 
+  filter(!(observers == "Sirilo Dulunaqio" & year(sample_date) < 2012))
+```
+
+## Calculate averages for life histories and coral richness
+
+Calculate averages for life history percentages and the total unique coral richness per sample event
+
+```{r}
+#| label: Calculate average life histories and coral richness
+
+fijiBenthicPitSeTBL <- fijiBenthicPitSuTBL %>% 
+  group_by(project, tags, country, site, latitude, longitude,
+           management, management_rules, sample_date, sample_event_id) %>% 
+  summarise(mean_percent_cover_life_histories_weedy = mean(percent_cover_life_histories_weedy),
+            mean_percent_cover_life_histories_generalist = mean(percent_cover_life_histories_generalist),
+            mean_percent_cover_life_histories_competitive = mean(percent_cover_life_histories_competitive),
+            mean_percent_cover_life_histories_stress_tolerant = mean(percent_cover_life_histories_stress_tolerant),
+            mean_percent_hard_coral = mean(percent_cover_benthic_category_hard_coral),
+            .groups = "keep")
+
+fijiBenthicPitSeTotalCoralRichTBL <- fijiBenthicPitObsTBL %>% 
+  filter(sample_unit_id %in% fijiBenthicPitSuTBL$sample_unit_ids &
+           benthic_category == "Hard coral") %>% 
+  group_by(sample_event_id) %>% 
+  summarise(NumUniqueHardCoralBAs = length(unique(benthic_attribute)))
+
+fijiBenthicPitSeTBL <- fijiBenthicPitSeTBL %>% 
+  left_join(fijiBenthicPitSeTotalCoralRichTBL,
+            by = "sample_event_id")
+```
+
+## Assign dominant life histories for most recent sample events
+
+Assign sample events to the dominant life history --\> avoidance, resistance, or recovery. Also filter to only use the most recent sample event
+
+```{r}
+#| label: Assign sample events to the dominant life histories
+
+#### Assign sample events to the dominant life histories ####
+fijiBenthicPitSeTBL <- fijiBenthicPitSeTBL %>% 
+  mutate(ClimateStrategy =
+           case_when(mean_percent_cover_life_histories_competitive > 
+                       mean_percent_cover_life_histories_weedy &
+                       mean_percent_cover_life_histories_competitive > 
+                       mean_percent_cover_life_histories_generalist &
+                       mean_percent_cover_life_histories_competitive > 
+                       mean_percent_cover_life_histories_stress_tolerant ~
+                       "avoidance",
+                     mean_percent_cover_life_histories_stress_tolerant > 
+                       mean_percent_cover_life_histories_weedy &
+                       mean_percent_cover_life_histories_stress_tolerant > 
+                       mean_percent_cover_life_histories_generalist &
+                       mean_percent_cover_life_histories_stress_tolerant > 
+                       mean_percent_cover_life_histories_competitive ~
+                       "resistance",
+                     mean_percent_cover_life_histories_weedy > 
+                       mean_percent_cover_life_histories_generalist &
+                       mean_percent_cover_life_histories_weedy >
+                       mean_percent_cover_life_histories_competitive &
+                       mean_percent_cover_life_histories_weedy > 
+                       mean_percent_cover_life_histories_stress_tolerant ~
+                       "recovery",
+                     .default = "none")) %>% 
+  mutate(ClimateStrategy = 
+           case_when(mean_percent_hard_coral < 30 | 
+                       NumUniqueHardCoralBAs < 10 ~
+                       "none",
+                     .default = ClimateStrategy))
+
+fijiClimateResTBL <- fijiBenthicPitSeTBL %>% 
+  group_by(site) %>%
+  slice_max(sample_date, n = 1) %>%
+  ungroup()
+
+```
+
+## Map the locations based on climate resilience strategies
+
+Create a leaflet map with the 50 reefs polygons and circles that are colored by climate resilience category and sized by hard coral cover (%).
+
+```{r}
+#| label: Create coral resilience map with 50 reefs polygons in leaflet
+
+fijiClimateResTBL <- fijiClimateResTBL %>% 
+  mutate(ClimateStrategy = factor(ClimateStrategy,
+                                  levels = c("avoidance", "resistance",
+                                             "recovery", "none")))
+
+#Open the 50 reefs fiji Geojson file
+fiftyReefsGeojson <- read_sf("FiftyReefsFiji.geojson")
+
+#Colors for 50 reefs
+fiftyReefsPal <- colorFactor("Dark2", domain = levels(fiftyReefsGeojson$BCU_nam))
+
+#Function to add size legend
+addLegendSize <- function(map, position, size_values, size_labels, title, colors, fillOpacity = 0.5, borderColor = "black") {
+  legend_html <- paste0(
+    '<div style="background-color: white; padding: 10px; border-radius: 5px;">',
+    '<strong>', title, '</strong><br>'
+  )
+  
+  for (i in seq_along(size_values)) {
+    size = size_values[i]
+    label = size_labels[i]
+    legend_html <- paste0(
+      legend_html,
+      '<div style="display: flex; align-items: center;">',
+      '<svg height="', size * 2, '" width="', size * 2, '">',
+      '<circle cx="', size, '" cy="', size, '" r="', size, 
+      '" fill="', colors, '" fill-opacity="', fillOpacity, 
+      '" stroke="', borderColor, '" stroke-width="1" />',
+      '</svg>',
+      '<span style="margin-left: 10px;">', label, '</span>',
+      '</div>'
+    )
+  }
+  
+  legend_html <- paste0(legend_html, '</div>')
+  addControl(map, html = HTML(legend_html), position = position)
+}
+
+# Define scaling function
+scale_size <- function(hard_coral_percentage, scale_factor = 3) {
+  hard_coral_percentage / scale_factor
+}
+
+# Legend size values and labels
+size_values <- scale_size(c(10, 20, 30, 40))  # Ensure alignment with scaling logic
+size_labels <- c("10%", "20%", "30%", "40%")
+
+# Define color legend
+color_pal <- colorFactor(
+  palette = c("#FF9999", "lightyellow", "#6699FF",  "#66CC66"),
+  domain = levels(fijiClimateResTBL$ClimateStrategy)
+)
+
+# Define a function to add circle markers
+addClimateStrategyMarkers <- function(map, data) {
+  map %>%
+    addCircleMarkers(
+      data = data,
+      radius = ~scale_size(mean_percent_hard_coral),
+      fillColor = ~color_pal(ClimateStrategy),  # Use color palette
+      color = "black",
+      weight = 1,
+      stroke = TRUE,
+      group = ~ClimateStrategy,  # Assign group dynamically
+      fillOpacity = 0.5,
+      popup = ~paste0("Category: ",
+                     ClimateStrategy, 
+                     "<br>Weedy: ",
+                     round(mean_percent_cover_life_histories_weedy, 2),
+                     "%",
+                     "<br>Generalist: ",
+                     round(mean_percent_cover_life_histories_generalist, 2),
+                     "%",
+                     "<br>Competitive: ",
+                     round(mean_percent_cover_life_histories_competitive, 2),
+                     "%",
+                     "<br>Stress tolerant: ",
+                     round(mean_percent_cover_life_histories_stress_tolerant, 2),
+                     "%",
+                     "<br># unique coral types: ",
+                     NumUniqueHardCoralBAs))}
+
+# Create a leaflet map with circle markers
+coralResilience50reefsMap <- leaflet() %>%
+  addTiles(group = "StreetMap") %>%
+  addProviderTiles(providers$Esri.WorldImagery, group = "ESRI World Imagery") %>%
+  setView(lng = 179, lat = -17.5, zoom = 8) %>%
+  addPolygons(data = fiftyReefsGeojson,
+              color = fiftyReefsPal(fiftyReefsGeojson$BCU_nam),
+              stroke = 1,
+              opacity = 0.8,
+              group = "50 Reefs") %>%
+  addClimateStrategyMarkers(fijiClimateResTBL) %>%  # Use the function
+  addLegendSize(
+    position = "bottomright",
+    size_values = size_values,
+    size_labels = size_labels,
+    title = "Circle Size: Hard Coral %",
+    colors = "black"
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = color_pal,
+    values = levels(fijiClimateResTBL$ClimateStrategy),  # Use factor levels
+    title = "Climate Strategy",
+    opacity = 1
+  ) %>%
+  addLegend(data = fiftyReefsGeojson,
+          position = "bottomright",
+          pal = fiftyReefsPal,
+          values = ~BCU_nam,
+          title = "50 Reefs Name",
+          opacity = 1) %>% 
+  addLayersControl(baseGroups = c("StreetMap", "ESRI World Imagery"),
+                   overlayGroups = c("avoidance", "resistance",
+                                     "recovery", "none", "50 Reefs"),
+                   position = "topright")
+
+# Save the map as an HTML file
+saveWidget(coralResilience50reefsMap, "../FijiClimateResilient50reefsMap.html",
+           selfcontained = TRUE)
+
+coralResilience50reefsMap
+```
